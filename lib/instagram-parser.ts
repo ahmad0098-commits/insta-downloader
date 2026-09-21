@@ -29,6 +29,10 @@ export type InstagramMedia = {
 
 const HTTPS_URL_RE = /^https:\/\//i;
 
+/** Instagram *page* URLs (posts/profiles) — never actual image files. */
+const INSTAGRAM_PAGE_URL_RE =
+  /^https:\/\/(www\.)?instagram\.com\/(p|reel|reels|tv)\//i;
+
 function asString(value: unknown): string | undefined {
   if (typeof value === "string") {
     const trimmed = value.trim();
@@ -64,7 +68,7 @@ function collectImageCandidates(item: Record<string, unknown>): string[] {
 
   const push = (value: unknown) => {
     const str = asString(value);
-    if (isHttpUrl(str)) candidates.push(str);
+    if (isHttpUrl(str) && !INSTAGRAM_PAGE_URL_RE.test(str)) candidates.push(str);
   };
 
   // images object with quality keys — ordered best → worst.
@@ -144,6 +148,7 @@ function extractUsername(item: Record<string, unknown>): string | undefined {
   const direct =
     asString(item.ownerUsername) ??
     asString(item.username) ??
+    asString(item.author) ??
     asString(item.owner_username);
   if (direct) return direct;
 
@@ -182,6 +187,65 @@ function extractMediaType(item: Record<string, unknown>): string | undefined {
 }
 
 /**
+ * Handle the easyapi/instagram-photos-downloader item shape directly:
+ *   { url, result: { author, title, thumbnail, medias: [{ url, width,
+ *      height, type, resolution }] } }
+ * Picks the highest-resolution image media. Returns null when the item does
+ * not match this shape (the generic parser handles those) or when only
+ * non-image media exists.
+ */
+function parseEasyApiMedia(item: Record<string, unknown>): InstagramMedia | null {
+  // Unwrap { url, result: {...} } envelope.
+  const inner =
+    item.result && typeof item.result === "object" && !Array.isArray(item.result)
+      ? (item.result as Record<string, unknown>)
+      : item;
+
+  // Actor-reported failure (post not found, deleted, private…).
+  if (inner.error === true) return null;
+
+  const medias = inner.medias;
+  if (!Array.isArray(medias)) return null;
+
+  const imageMedias: { url: string; width?: number; height?: number }[] = [];
+  for (const m of medias) {
+    if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+    const obj = m as Record<string, unknown>;
+    const type = asString(obj.type);
+    // Only actual images; skip videos/other media types.
+    if (type && !type.toLowerCase().includes("image")) continue;
+    const url = asString(obj.url);
+    if (!isHttpUrl(url)) continue;
+    imageMedias.push({
+      url,
+      width: asPositiveInt(obj.width),
+      height: asPositiveInt(obj.height),
+    });
+  }
+  if (imageMedias.length === 0) return null;
+
+  // Highest resolution first.
+  imageMedias.sort(
+    (a, b) => (b.width ?? 0) * (b.height ?? 0) - (a.width ?? 0) * (a.height ?? 0),
+  );
+  const best = imageMedias[0];
+
+  const thumbnail = collectImageCandidates({ thumbnail: inner.thumbnail })[0];
+  const caption = extractCaption(inner);
+  const username = extractUsername(inner);
+
+  return {
+    imageUrl: best.url,
+    ...(thumbnail && thumbnail !== best.url ? { thumbnailUrl: thumbnail } : {}),
+    ...(caption ? { caption } : {}),
+    ...(username ? { username } : {}),
+    ...(best.width !== undefined ? { width: best.width } : {}),
+    ...(best.height !== undefined ? { height: best.height } : {}),
+    mediaType: "image",
+  };
+}
+
+/**
  * Find the first dataset item that yields at least one usable public image
  * URL and return the normalized media. Returns null when nothing usable
  * exists (private/deleted post, video-only result, empty dataset…).
@@ -192,6 +256,23 @@ export function parseInstagramMedia(
   for (const entry of datasetItems) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const item = entry as Record<string, unknown>;
+
+    // easyapi/instagram-photos-downloader shape (author/title/medias).
+    const easyApiMedia = parseEasyApiMedia(item);
+    if (easyApiMedia) return easyApiMedia;
+
+    // Skip Actor-reported failures (post not found, private, deleted…) —
+    // never let the wrapped { url, result: { error: true } } envelope fall
+    // through to the generic parser.
+    const result = item.result;
+    if (
+      result &&
+      typeof result === "object" &&
+      !Array.isArray(result) &&
+      (result as Record<string, unknown>).error === true
+    ) {
+      continue;
+    }
 
     const imageUrl = collectImageCandidates(item).find((url) =>
       // Only https CDN URLs are usable; drop anything else defensively.

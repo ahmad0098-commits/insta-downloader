@@ -5,53 +5,33 @@
  * app/api/. It reads APIFY_API_TOKEN from server-side environment variables
  * and NEVER sends the token to the client.
  *
- * ─── WHERE TO PUT THE TOKEN ───────────────────────────────────────────────
+ * ─── WHERE TO PUT THE TOKEN ──────────────────────────────────────────────
  * Create `.env.local` in the project root (see `.env.example`):
  *
  *   APIFY_API_TOKEN=apify_api_XXXXXXXXXXXXXXXX
- *   APIFY_ACTOR_ID=apify/instagram-scraper
+ *   APIFY_ACTOR_ID=easyapi/instagram-photos-downloader
  *
  * Get your token at https://apify.com → Settings → Integrations → API token.
  * On Vercel add the same variables under Project → Settings → Environment
  * Variables. Do NOT prefix them with NEXT_PUBLIC_.
  *
- * ─── HOW TO CHANGE THE ACTOR ───────────────────────────────────────────────
- * Set APIFY_ACTOR_ID to any Actor ID (owner/name) that:
- *   1. Accepts input containing a list of Instagram post URLs, and
- *   2. Produces a dataset whose items describe the fetched media
- *      (image URLs, optional author/username, caption, dimensions…).
+ * ─── HOW TO CHANGE THE ACTOR ──────────────────────────────────────────────
+ * Set APIFY_ACTOR_ID to any Actor ID (owner/name). Two input/output schemas
+ * are supported out of the box (see `buildActorInput()` and
+ * `lib/instagram-parser.ts`):
  *
- * The default input below targets the official `apify/instagram-scraper`
- * Actor. If you switch Actors, only `buildActorInput()` and (if the output
- * shape differs) `lib/instagram-parser.ts` need adjustments — the rest of
- * the app is Actor-agnostic.
+ *  1. easyapi/* Actors (default) — input { url }, output dataset item:
+ *     { url, result: { author, title, thumbnail, medias: [{ url, width,
+ *       height, type, resolution }] } } or { result: { error: true } }.
+ *  2. apify/instagram-scraper style — input { directUrls, resultsType,
+ *     resultsLimit }, output items with displayUrl/images/caption fields.
  *
- * ─── EXPECTED ACTOR INPUT (default: apify/instagram-scraper) ───────────────
- * {
- *   "directUrls":   ["https://www.instagram.com/p/SHORTCODE/"],
- *   "resultsType":  "posts",
- *   "resultsLimit": 1
- * }
+ * For any other Actor, adapt `buildActorInput()` and (if the output shape
+ * differs) `lib/instagram-parser.ts` — the rest of the app is
+ * Actor-agnostic. Parsing is intentionally tolerant so small differences
+ * do not break the app.
  *
- * ─── EXPECTED ACTOR OUTPUT (dataset items, simplified) ─────────────────────
- * [
- *   {
- *     "shortCode": "SHORTCODE",
- *     "displayUrl": "https://scontent...cdninstagram.com/...jpg",
- *     "thumbnailUrl": "https://...jpg",
- *     "images": { "low": "...", "standard": "...", "high": "..." },
- *     "videoUrl": "https://...mp4" | null,
- *     "caption": "#caption text…",
- *     "ownerUsername": "some_user",
- *     "dimensions": { "width": 1080, "height": 1080 },
- *     "isVideo": false
- *   }
- * ]
- *
- * Parsing is intentionally tolerant: `lib/instagram-parser.ts` normalizes
- * many common shapes so small Actor differences do not break the app.
- *
- * ─── HOW TO TEST LOCALLY ────────────────────────────────────────────────────
+ * ─── HOW TO TEST LOCALLY ──────────────────────────────────────────────
  *   npm install
  *   cp .env.example .env.local   # then paste your token
  *   npm run dev                  # http://localhost:3000
@@ -62,8 +42,12 @@ import { parseInstagramMedia, type InstagramMedia } from "./instagram-parser";
 
 const APIFY_API_BASE = "https://api.apify.com/v2";
 
-/** Default Actor when APIFY_ACTOR_ID is not set (official public scraper). */
-export const DEFAULT_ACTOR_ID = "apify/instagram-scraper";
+/** Default Actor when APIFY_ACTOR_ID is not set.
+ *  Input contract: { url: "<instagram post url>" }
+ *  Output contract (dataset item): { url, result: { author, title,
+ *  thumbnail, medias: [{ url, width, height, type, resolution }] } }
+ *  or { url, result: { error: true, message } } when the post is not found. */
+export const DEFAULT_ACTOR_ID = "easyapi/instagram-photos-downloader";
 
 /** Actor run timeout in milliseconds. */
 const ACTOR_TIMEOUT_MS = 90_000;
@@ -78,9 +62,23 @@ export type ApifyFetchResult =
 
 /**
  * Build the input payload for the configured Actor.
- * If you switch to another Actor, adapt this function to its input schema.
+ *
+ * Two schemas are supported out of the box:
+ *  - "easyapi/*" Actors (default): { url: "<post url>" } — see the Actor's
+ *    input schema on its Apify Store page.
+ *  - apify/instagram-scraper style Actors: { directUrls, resultsType,
+ *    resultsLimit } — the original generic contract.
+ * If you switch to a third Actor, adapt this function to its input schema.
  */
-function buildActorInput(postUrl: string): Record<string, unknown> {
+function buildActorInput(
+  postUrl: string,
+  actorId: string,
+): Record<string, unknown> {
+  if (actorId.startsWith("easyapi/")) {
+    // easyapi/instagram-photos-downloader and siblings.
+    return { url: postUrl };
+  }
+  // Generic apify/instagram-scraper style input.
   return {
     // Direct URLs of public Instagram posts/reels to scrape.
     directUrls: [postUrl],
@@ -145,7 +143,7 @@ export async function fetchInstagramMedia(
     response = await fetchWithTimeout(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildActorInput(canonicalPostUrl)),
+      body: JSON.stringify(buildActorInput(canonicalPostUrl, actorId)),
       timeoutMs: ACTOR_TIMEOUT_MS + 10_000, // network slack on top of Actor timeout
       cache: "no-store",
     });
@@ -188,7 +186,19 @@ export async function fetchInstagramMedia(
 
   const media = parseInstagramMedia(items);
   if (!media) {
-    return { ok: false, reason: "no_media" };
+    // Distinguish "post not found/deleted" (result.error items) from
+    // "no usable public image" so the user gets the right message.
+    const hadErrorResults = items.some(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        !Array.isArray(entry) &&
+        (entry as Record<string, unknown>).result !== undefined &&
+        typeof (entry as Record<string, unknown>).result === "object" &&
+        ((entry as Record<string, unknown>).result as Record<string, unknown>)
+          .error === true,
+    );
+    return { ok: false, reason: hadErrorResults ? "no_results" : "no_media" };
   }
   return { ok: true, media };
 }
