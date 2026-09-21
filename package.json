@@ -1,0 +1,25 @@
+{
+  "name": "insta-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Baixar Foto do Instagram — baixe fotos públicas do Instagram em alta qualidade. Next.js + Apify (server-side).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "next": "^15.1.6",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}
